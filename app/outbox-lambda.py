@@ -30,39 +30,48 @@ dynamodb = boto3.resource(
     endpoint_url=DYNAMODB_ENDPOINT,
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY
-) 
+)
+dynamodb_client = boto3.client('dynamodb')
 
 orders_table = dynamodb.Table(ORDERS_TABLE)
 outbox_table = dynamodb.Table(OUTBOX_TABLE)
 
 logger.info(f"Connected to DynamoDB in region {REGION}")
 
-def insert_order(data, timestamp):
-    item = {
-        "userId": data["userId"],
-        "orderId": data["orderId"],
-        "courierId": data.get("courierId"),
-        "notificationId": data.get("notificationId"),
-        "message": data.get("message"),
-        "createdAt": timestamp
-    }
+def insert_order_and_outbox(data, timestamp):
+    response = dynamodb_client.transact_write_items(
+        TransactItems=[
+            {
+                'Put': {
+                    'TableName': ORDERS_TABLE,
+                    'Item': {
+                        'userId': {'S': data["userId"]},
+                        'orderId': {'S': data["orderId"]},
+                        'courierId': {'S': data.get("courierId")},
+                        'notificationId': {'S': data.get("notificationId")},
+                        'message': {'S': data.get("message")},
+                        'createdAt': {'S': str(timestamp)}
 
-    logger.info(f"Inserting order {item['orderId']} into {ORDERS_TABLE}")
-    return orders_table.put_item(Item=item)
+                    }
+                }
+            },
+            {
+                'Put': {
+                    'TableName': OUTBOX_TABLE,
+                    'Item': {
+                        'orderId': {'S': data["orderId"]},
+                        'eventId': {'S': str(uuid4())},
+                        'eventType': {'S': data["eventType"]},
+                        'eventTimestamp': {'S': str(timestamp)},
+                        'status': {'S': "PENDING"},
+                        'payload': {'S': json.dumps(data)}
+                    }
+                }
+            }
+        ]
+    )
+    return response
 
-def insert_outbox(data, timestamp):
-    event_id = str(uuid4())
-    item = {
-        "orderId": data["orderId"],
-        "eventId": event_id,
-        "eventType": data["eventType"],
-        "eventTimestamp": timestamp,
-        "status": "PENDING",
-        "payload": data
-    }
-
-    logger.info(f"Inserting outbox event {event_id} for order {item['orderId']} into {OUTBOX_TABLE}")
-    return outbox_table.put_item(Item=item)
 
 def process_record(record):
     body = record.get("body") if isinstance(record, dict) and "body" in record else record
@@ -75,9 +84,9 @@ def process_record(record):
 
     timestamp = data.get("eventTimestamp", datetime.now())
 
-    # Insert into both tables
-    insert_order(data, timestamp)
-    insert_outbox(data, timestamp)
+    logger.info(f"Inserting order and outbox for orderId={data['orderId']}")
+    # Insert into both tables in the same transaction
+    insert_order_and_outbox(data, timestamp)
 
     logger.info(f"Successfully processed orderId={data['orderId']}")
 
